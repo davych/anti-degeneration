@@ -1,0 +1,125 @@
+---
+name: anti-degeneration
+description: End-of-task self-review checklist. MUST be invoked before the final reply of any task that modified, created, or deleted files. Also invoke when the user says "self-check", "poke holes in this", "review your plan", or "is this over-engineered?". Checks for over-engineering, unilateral decisions, hallucinations, and runaway complexity. Skip for pure chat or read-only Q&A.
+triggers:
+  - user
+  - model
+allowed-tools:
+  - read
+  - grep
+  - glob
+permissions:
+  allow:
+    - Exec(git status)
+    - Exec(git diff)
+---
+
+# End-of-Task Self-Review (Anti-Degeneration)
+
+Before giving the final reply, go through the steps below in order. If any step fails, fix the issue first. Never deliver with known problems.
+
+## Step 1: Check against the five principles
+
+### Principle 1: Decision details — ask when unsure
+
+- When the direction is unclear, first gather context yourself: read the code, check the config, review the conversation. Draw conclusions only once you have enough information.
+- If several reasonable directions remain after that, you **must ask the user**. Do not decide implementation details on your own.
+- Self-check: Did I make any choice on the user's behalf that they did not ask for? If so, list it explicitly in the reply, or revert and ask.
+
+### Principle 2: Match the complexity of the existing code
+
+- Stay focused. Solve only the problem the user raised.
+- New code must match the surrounding code in abstraction level, file structure, naming style, and error-handling granularity.
+- Self-check: If the surrounding code is 10 straightforward lines, did I write 50 lines with extra abstractions?
+
+### Principle 3: Changing base config, platform capabilities, or native features
+
+| Situation | How to handle |
+|-----------|---------------|
+| User explicitly asked for the change | Change it directly |
+| Not explicitly asked | Weigh complexity, over-engineering, code growth, and ease of review. Use **the most direct, native approach** |
+| Hard to decide | Propose one straightforward option and ask the user |
+
+**Reference case**
+
+- Environment: microservice A + a Vite frontend; runs both locally and in production.
+- Request: configure a local proxy to service A so the frontend can call it.
+- Known: local dev uses the Vite config proxy. Unknown: production uses Caddy as the proxy.
+- Bad result (over-engineered): the proxy logic was put inside `plugins` and extracted into a separate JS file full of header, cookie, and path handling.
+- Good result: add the needed entries directly under `server.proxy`: source path, target address, whether to `rewrite`, and nothing else.
+- Takeaway: change only the local environment the user mentioned. Do not guess about the unknown production setup, and do not "unify" things on the side.
+
+### Principle 4: Legacy compatibility
+
+- By default, do **not** add backward compatibility, fallbacks, or dual code paths unless the user explicitly asks. Many changes are allowed to break things.
+- When unsure, ask: "This is a breaking change. Should we drop support for the old behavior, or keep it compatible?"
+- Self-check: Did I add any fallback, compatibility branch, or default-value safety net the user did not ask for? If so, remove it or ask.
+
+### Principle 5: Critical review Q&A
+
+See Step 2.
+
+## Step 2: Critical review Q&A
+
+**Pure Q&A / no code changes**: the main agent goes through the checklist below on its own.
+
+**Code changes present** (`git status` shows modified or new files): spawn a **fresh, clean subagent for a blind review**, using the read-only `subagent_explore` profile. It can only read, grep, and glob; it cannot run commands. The subagent cannot see this conversation, so the main agent first runs `git diff` and puts these in the task:
+
+- the user's original request, verbatim
+- the `git diff` output
+- the paths of any new files (untracked files do not appear in the diff, so tell it to read them directly)
+
+Ask it to answer the checklist item by item and finish with a verdict: "Pass / Needs simplification / Needs user input". The main agent then responds to each point: apply the change if accepted, or state the reason if not.
+
+### Review checklist
+
+1. **Structure and side effects (against over-engineering)**
+   - Are there large structural changes, unnecessary abstractions, or spillover changes (files or config the user never mentioned)?
+   - If so, are they necessary? If not: if this logic were cut by 50%, with all the "fancy design" stripped out, what would the single core path look like? Give the minimal version.
+
+2. **Cognition and memory (against hallucination and logic drift)**
+   - What are the "atomic facts" behind this conclusion? Can each one be traced to a specific file, line number, command output, or the user's own words?
+   - Did I invent any API, config option, or file, or over-extend some vague piece of context?
+   - If noise or bad input appears in an intermediate step, where does the correction happen? Or would the error snowball?
+
+3. **Boundaries and extreme conditions (against blind optimism)**
+   - With empty, huge, garbled, or maliciously injected input, which line breaks?
+   - Did token usage, request count, or latency double? Where is the payoff?
+
+4. **Concepts and definitions (against vague language)**
+   - For every buzzword in the reply (e.g., "smart scheduling", "dynamic adaptation", "unified wrapper"), which field, function, or file does it map to in the code? If it maps to nothing, delete the word.
+
+## Step 3: Negative constraints (hard rules)
+
+The changes must satisfy all of the following. Otherwise, simplify before delivering:
+
+- If 10 lines can solve it, do not write 50.
+- Do not add more than two levels of nesting (conditionals, callbacks, abstraction layers).
+- Do not create a new utility function, file, or abstraction layer for a single call site.
+- Do not modify config, dependencies, or platform capabilities the user did not mention (except where Principle 3 allows it).
+- Do not add compatibility shims, fallbacks, retries, or toggles the user did not ask for.
+- When a native feature or framework config option already exists, use it instead of building your own.
+
+## Step 4: Plain-language test
+
+In 3–5 sentences a middle schooler could follow, explain what changed, why, and how you verified it is correct.
+
+- If you cannot explain it clearly, the logic has drifted into self-indulgence. Rethink or simplify the approach.
+- Use this explanation as the summary in the final reply.
+
+## Step 5: Prune and roll back
+
+If you notice yourself going in circles at the wrong level of complexity (the same problem changed 3+ times without converging, or the change is far larger than the request):
+
+- Stop. Do not pile fixes on top of mistakes.
+- Explain the situation to the user and **propose** going back to the last clean, stable state to start over.
+- Any operation that discards changes, such as `git reset --hard` or `git checkout -- <file>`, **requires the user's explicit confirmation first**. Never run it on your own.
+
+## Output
+
+At the end of the final reply, add a short self-review conclusion: at most 5 lines, in plain language, no jargon. Omit any item that has nothing to report:
+
+- What was done (the plain-language summary from Step 4)
+- Anything the user did not specify that I decided myself, with a note: "Tell me if you disagree and I'll change it back"
+- Questions that need the user's decision (e.g., whether to keep the old behavior working)
+- Problems found during self-review, and how I fixed them
